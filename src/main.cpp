@@ -453,151 +453,90 @@ static AppConfig build_config_from_args(int argc, char* argv[]) {
         cfg.can0_thread_cfg.cpu_core = -1;
         cfg.can1_thread_cfg.cpu_core = -1;
         cfg.stress_cfg.cpu_cores = {};
-#include "app.hpp"
-
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <csignal>
-#include <cstring>
-#include <fstream>
-#include <iomanip>
-#include <iostream>
-#include <map>
-#include <mutex>
-#include <thread>
-#include <vector>
-
-#include <pthread.h>
-#include <sched.h>
-#include <time.h>
-#include <unistd.h>
-
-#include <linux/can.h>
-#include <linux/can/raw.h>
-#include <net/if.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-
-// =========================
-// 全局变量
-// =========================
-static std::atomic<bool> g_stop{false};
-
-static std::mutex g_log_mtx;
-static std::condition_variable g_log_cv;
-static std::vector<TxRecord> g_log_buffer;
-
-// =========================
-// 时间工具
-// =========================
-static uint64_t now_ns() {
-    timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
-}
-
-static timespec ns_to_timespec(uint64_t ns) {
-    timespec ts{};
-    ts.tv_sec = ns / 1000000000ULL;
-    ts.tv_nsec = ns % 1000000000ULL;
-    return ts;
-}
-
-static void sleep_until_ns(uint64_t abs_ns) {
-    timespec ts = ns_to_timespec(abs_ns);
-    while (!g_stop.load()) {
-        int ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
-        if (ret == 0) break;
-        if (ret != EINTR) break;
-    }
-}
-
-// =========================
-// 调度与 affinity
-// =========================
-static int parse_sched_policy(const std::string& s) {
-    if (s == "other") return SCHED_OTHER;
-    if (s == "fifo")  return SCHED_FIFO;
-    if (s == "rr")    return SCHED_RR;
-    return SCHED_OTHER;
-}
-
-static const char* sched_policy_name(int policy) {
-    switch (policy) {
-        case SCHED_OTHER: return "OTHER";
-        case SCHED_FIFO:  return "FIFO";
-        case SCHED_RR:    return "RR";
-        default:          return "UNKNOWN";
-    }
-}
-
-static bool set_thread_sched(pthread_t tid, int policy, int priority) {
-    sched_param sp{};
-    sp.sched_priority = priority;
-    int ret = pthread_setschedparam(tid, policy, &sp);
-    if (ret != 0) {
-        std::cerr << "[WARN] pthread_setschedparam failed, ret=" << ret
-                  << " policy=" << sched_policy_name(policy)
-                  << " priority=" << priority << "\n";
-        return false;
-    }
-    return true;
-}
-
-static bool set_thread_affinity(pthread_t tid, int core_id) {
-    if (core_id < 0) return true;
-
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset);
-
-    int ret = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
-    if (ret != 0) {
-        std::cerr << "[WARN] pthread_setaffinity_np failed, ret=" << ret
-                  << " core=" << core_id << "\n";
-        return false;
-    }
-    return true;
-}
-
-static int current_cpu() {
-#ifdef __linux__
-    return sched_getcpu();
-#else
-    return -1;
-#endif
-}
-
-// =========================
-// SocketCAN 工具
-// =========================
-static int open_can_socket(const std::string& ifname) {
-    int sock = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (sock < 0) {
-        perror("socket(PF_CAN) failed");
-        return -1;
     }
 
-    ifreq ifr{};
-    std::strncpy(ifr.ifr_name, ifname.c_str(), IFNAMSIZ - 1);
-
-    if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
-        perror("ioctl(SIOCGIFINDEX) failed");
-        close(sock);
-        return -1;
+    if (stress == "high") {
+        cfg.stress_cfg.thread_count = stress_threads;
+        cfg.stress_cfg.busy_ratio = 100;
+    } else {
+        cfg.stress_cfg.thread_count = 0;
+        cfg.stress_cfg.busy_ratio = 0;
     }
 
-    sockaddr_can addr{};
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
+    cfg.can0_tasks = make_demo_tasks_can00();
+    cfg.can1_tasks = make_demo_tasks_can01();
 
-    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        perror("bind(AF_CAN) failed");
-        close(sock);
-        return -1;
+    return cfg;
+}
+
+// =========================
+// main
+// =========================
+int main(int argc, char* argv[]) {
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
+    AppConfig cfg = build_config_from_args(argc, argv);
+
+    std::cout << "========== dual CAN realtime sender ==========\n";
+    std::cout << "exp_id      : " << cfg.exp_id << "\n";
+    std::cout << "duration    : " << cfg.duration_sec << " s\n";
+    std::cout << "can0        : " << cfg.can0_ifname << "\n";
+    std::cout << "can1        : " << cfg.can1_ifname << "\n";
+    std::cout << "policy      : " << sched_policy_name(cfg.can0_thread_cfg.sched_policy) << "\n";
+    std::cout << "priority0   : " << cfg.can0_thread_cfg.sched_priority << "\n";
+    std::cout << "priority1   : " << cfg.can1_thread_cfg.sched_priority << "\n";
+    std::cout << "core(can0)  : " << cfg.can0_thread_cfg.cpu_core << "\n";
+    std::cout << "core(can1)  : " << cfg.can1_thread_cfg.cpu_core << "\n";
+    std::cout << "stress_cnt  : " << cfg.stress_cfg.thread_count << "\n";
+    std::cout << "stress_busy : " << cfg.stress_cfg.busy_ratio << "\n";
+    std::cout << "log_path    : " << cfg.log_path << "\n";
+    std::cout << "=============================================\n";
+
+    std::thread logger_th(logger_worker, cfg.log_path);
+
+    TxWorkerArgs can0_args;
+    can0_args.exp_id = cfg.exp_id;
+    can0_args.ifname = cfg.can0_ifname;
+    can0_args.thread_cfg = cfg.can0_thread_cfg;
+    can0_args.tasks = cfg.can0_tasks;
+
+    TxWorkerArgs can1_args;
+    can1_args.exp_id = cfg.exp_id;
+    can1_args.ifname = cfg.can1_ifname;
+    can1_args.thread_cfg = cfg.can1_thread_cfg;
+    can1_args.tasks = cfg.can1_tasks;
+
+    std::thread can0_th(tx_worker, can0_args);
+    std::thread can1_th(tx_worker, can1_args);
+
+    std::vector<std::thread> stress_threads;
+    for (int i = 0; i < cfg.stress_cfg.thread_count; ++i) {
+        StressWorkerArgs sargs;
+        sargs.index = i;
+        sargs.busy_ratio = cfg.stress_cfg.busy_ratio;
+
+        if (!cfg.stress_cfg.cpu_cores.empty()) {
+            sargs.cpu_core = cfg.stress_cfg.cpu_cores[i % cfg.stress_cfg.cpu_cores.size()];
+        } else {
+            sargs.cpu_core = -1;
+        }
+
+        stress_threads.emplace_back(stress_worker, sargs);
     }
 
-    return sock;
+    std::this_thread::sleep_for(std::chrono::seconds(cfg.duration_sec));
+
+    g_stop.store(true);
+    g_log_cv.notify_all();
+
+    for (auto& th : stress_threads) {
+        if (th.joinable()) th.join();
+    }
+    if (can0_th.joinable()) can0_th.join();
+    if (can1_th.joinable()) can1_th.join();
+    if (logger_th.joinable()) logger_th.join();
+
+    std::cout << "[INFO] experiment finished.\n";
+    return 0;
+}
