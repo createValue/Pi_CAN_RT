@@ -1,0 +1,1 @@
+/usr/bin/c++ CMakeFiles/dual_can_rt.dir/src/main.cpp.o -o dual_can_rt  -lpthread 
