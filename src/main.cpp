@@ -1,542 +1,560 @@
 #include "app.hpp"
 
-#include <algorithm>
-#include <atomic>
-#include <chrono>
-#include <condition_variable>
-#include <csignal>
-#include <cstring>
-#include <fstream>
-#include <iomanip>
-#include <iostream>
-#include <map>
-#include <mutex>
-#include <thread>
-#include <vector>
-
-#include <pthread.h>
-#include <sched.h>
-#include <time.h>
-#include <unistd.h>
-
-#include <linux/can.h>
-#include <linux/can/raw.h>
-#include <net/if.h>
-#include <sys/ioctl.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-
-// =========================
-// 全局变量
-// =========================
 static std::atomic<bool> g_stop{false};
 
-static std::mutex g_log_mtx;
-static std::condition_variable g_log_cv;
-static std::vector<TxRecord> g_log_buffer;
+struct TaskRuntime {
+    TaskConfig cfg;
+    uint64_t next_release_ns = 0;
+    uint32_t seq = 0;
+};
 
-// =========================
-// 时间工具
-// =========================
-static uint64_t now_ns() {
-    timespec ts{};
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
-}
-
-static timespec ns_to_timespec(uint64_t ns) {
-    timespec ts{};
-    ts.tv_sec = ns / 1000000000ULL;
-    ts.tv_nsec = ns % 1000000000ULL;
-    return ts;
-}
-
-static void sleep_until_ns(uint64_t abs_ns) {
-    timespec ts = ns_to_timespec(abs_ns);
-    while (!g_stop.load()) {
-        int ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr);
-        if (ret == 0) break;
-        if (ret != EINTR) break;
+struct RxLastSeqKey {
+    uint8_t link_id;
+    uint8_t task_id;
+    bool operator<(const RxLastSeqKey& other) const {
+        if (link_id != other.link_id) return link_id < other.link_id;
+        return task_id < other.task_id;
     }
-}
+};
 
-// =========================
-// 调度与 affinity
-// =========================
-static int parse_sched_policy(const std::string& s) {
-    if (s == "other") return SCHED_OTHER;
-    if (s == "fifo")  return SCHED_FIFO;
-    if (s == "rr")    return SCHED_RR;
-    return SCHED_OTHER;
-}
-
-static const char* sched_policy_name(int policy) {
-    switch (policy) {
-        case SCHED_OTHER: return "OTHER";
-        case SCHED_FIFO:  return "FIFO";
-        case SCHED_RR:    return "RR";
-        default:          return "UNKNOWN";
-    }
-}
-
-static bool set_thread_sched(pthread_t tid, int policy, int priority) {
-    sched_param sp{};
-    sp.sched_priority = priority;
-    int ret = pthread_setschedparam(tid, policy, &sp);
-    if (ret != 0) {
-        std::cerr << "[WARN] pthread_setschedparam failed, ret=" << ret
-                  << " policy=" << sched_policy_name(policy)
-                  << " priority=" << priority << "\n";
-        return false;
-    }
-    return true;
-}
-
-static bool set_thread_affinity(pthread_t tid, int core_id) {
-    if (core_id < 0) return true;
-
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset);
-
-    int ret = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
-    if (ret != 0) {
-        std::cerr << "[WARN] pthread_setaffinity_np failed, ret=" << ret
-                  << " core=" << core_id << "\n";
-        return false;
-    }
-    return true;
-}
-
-static int current_cpu() {
-#ifdef __linux__
-    return sched_getcpu();
-#else
-    return -1;
-#endif
-}
-
-// =========================
-// SocketCAN 工具
-// =========================
-static int open_can_socket(const std::string& ifname) {
-    int sock = socket(PF_CAN, SOCK_RAW, CAN_RAW);
-    if (sock < 0) {
-        perror("socket(PF_CAN) failed");
-        return -1;
-    }
-
-    ifreq ifr{};
-    std::strncpy(ifr.ifr_name, ifname.c_str(), IFNAMSIZ - 1);
-
-    if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
-        perror("ioctl(SIOCGIFINDEX) failed");
-        close(sock);
-        return -1;
-    }
-
-    sockaddr_can addr{};
-    addr.can_family = AF_CAN;
-    addr.can_ifindex = ifr.ifr_ifindex;
-
-    if (bind(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        perror("bind(AF_CAN) failed");
-        close(sock);
-        return -1;
-    }
-
-    return sock;
-}
-
-static int send_can_frame(int sock, uint32_t can_id, const uint8_t* data, uint8_t dlc) {
-    can_frame frame{};
-    frame.can_id = can_id;
-    frame.can_dlc = dlc;
-    std::memcpy(frame.data, data, dlc);
-
-    return write(sock, &frame, sizeof(frame));
-}
-
-// =========================
-// 信号处理
-// =========================
 static void signal_handler(int) {
     g_stop.store(true);
-    g_log_cv.notify_all();
 }
 
-// =========================
-// 命令行解析
-// =========================
-static std::string get_arg(int argc, char* argv[], const std::string& key, const std::string& def) {
-    for (int i = 1; i < argc - 1; ++i) {
-        if (argv[i] == key) return argv[i + 1];
-    }
-    return def;
+static bool ensure_dir(const std::string& path) {
+    std::string cmd = "mkdir -p " + path;
+    return std::system(cmd.c_str()) == 0;
 }
 
-static int get_arg_int(int argc, char* argv[], const std::string& key, int def) {
-    for (int i = 1; i < argc - 1; ++i) {
-        if (argv[i] == key) return std::stoi(argv[i + 1]);
-    }
-    return def;
+static void write_csv_header_tx(std::ofstream& ofs) {
+    ofs << "event_type,host_event_ns,link_id,task_id,ifname,thread_name,can_id,seq,"
+           "nominal_period_ns,planned_release_ns,wakeup_ns,send_call_ns,send_ret,"
+           "cpu_id,sched_policy,sched_priority\n";
 }
 
-// =========================
-// demo 任务表
-// 注意：这里只是第一版骨架，不是最终 >60% 负载正式表
-// =========================
-static std::vector<CanTask> make_demo_tasks_can00() {
-    uint64_t t0 = now_ns() + 1000000000ULL;
-
-    std::vector<CanTask> tasks = {
-        {0x100, 10000000, 8, true,  0, t0},
-        {0x101, 20000000, 8, true,  0, t0},
-        {0x110, 1000000,  8, false, 0, t0},
-        {0x111, 2000000,  8, false, 0, t0},
-    };
-    return tasks;
+static void write_csv_header_rx(std::ofstream& ofs) {
+    ofs << "event_type,host_event_ns,link_id,task_id,ifname,thread_name,can_id,seq,dlc,"
+           "rx_kernel_ts_ns,rx_user_read_ns,loss_count,"
+           "cpu_id,sched_policy,sched_priority\n";
 }
 
-static std::vector<CanTask> make_demo_tasks_can01() {
-    uint64_t t0 = now_ns() + 1000000000ULL;
-
-    std::vector<CanTask> tasks = {
-        {0x200, 10000000, 8, true,  0, t0},
-        {0x201, 20000000, 8, true,  0, t0},
-        {0x210, 1000000,  8, false, 0, t0},
-        {0x211, 2000000,  8, false, 0, t0},
-    };
-    return tasks;
+static void write_csv_header_info(std::ofstream& ofs) {
+    ofs << "event_type,host_event_ns,link_id,task_id,ifname,thread_name,can_id,seq,"
+           "nominal_period_ns,planned_release_ns,wakeup_ns,send_call_ns,send_ret,"
+           "rx_kernel_ts_ns,rx_user_read_ns,loss_count,"
+           "cpu_id,sched_policy,sched_priority\n";
 }
 
-// =========================
-// 工具函数
-// =========================
-static size_t find_earliest_task_index(const std::vector<CanTask>& tasks) {
-    size_t idx = 0;
-    uint64_t min_t = tasks[0].next_release_ns;
-    for (size_t i = 1; i < tasks.size(); ++i) {
-        if (tasks[i].next_release_ns < min_t) {
-            min_t = tasks[i].next_release_ns;
-            idx = i;
+static void logger_thread_fn(EventQueue* q, const std::string out_dir) {
+    ensure_dir(out_dir);
+
+    std::ofstream tx_ofs(out_dir + "/tx_log.csv");
+    std::ofstream rx_ofs(out_dir + "/rx_log.csv");
+    std::ofstream info_ofs(out_dir + "/info_log.csv");
+
+    write_csv_header_tx(tx_ofs);
+    write_csv_header_rx(rx_ofs);
+    write_csv_header_info(info_ofs);
+
+    EventRecord ev{};
+    while (!g_stop.load()) {
+        if (!q->pop(ev, g_stop)) continue;
+
+        if (ev.type == EventType::TX) {
+            tx_ofs
+                << "TX" << ','
+                << ev.host_event_ns << ','
+                << static_cast<unsigned>(ev.link_id) << ','
+                << static_cast<unsigned>(ev.task_id) << ','
+                << ev.ifname << ','
+                << ev.thread_name << ','
+                << ev.can_id << ','
+                << ev.seq << ','
+                << ev.nominal_period_ns << ','
+                << ev.planned_release_ns << ','
+                << ev.wakeup_ns << ','
+                << ev.send_call_ns << ','
+                << ev.send_ret << ','
+                << ev.cpu_id << ','
+                << ev.sched_policy << ','
+                << ev.sched_priority << '\n';
+        } else if (ev.type == EventType::RX || ev.type == EventType::LOSS) {
+            rx_ofs
+                << (ev.type == EventType::RX ? "RX" : "LOSS") << ','
+                << ev.host_event_ns << ','
+                << static_cast<unsigned>(ev.link_id) << ','
+                << static_cast<unsigned>(ev.task_id) << ','
+                << ev.ifname << ','
+                << ev.thread_name << ','
+                << ev.can_id << ','
+                << ev.seq << ','
+                << static_cast<unsigned>(ev.dlc) << ','
+                << ev.rx_kernel_ts_ns << ','
+                << ev.rx_user_read_ns << ','
+                << ev.loss_count << ','
+                << ev.cpu_id << ','
+                << ev.sched_policy << ','
+                << ev.sched_priority << '\n';
+        } else {
+            info_ofs
+                << "INFO" << ','
+                << ev.host_event_ns << ','
+                << static_cast<unsigned>(ev.link_id) << ','
+                << static_cast<unsigned>(ev.task_id) << ','
+                << ev.ifname << ','
+                << ev.thread_name << ','
+                << ev.can_id << ','
+                << ev.seq << ','
+                << ev.nominal_period_ns << ','
+                << ev.planned_release_ns << ','
+                << ev.wakeup_ns << ','
+                << ev.send_call_ns << ','
+                << ev.send_ret << ','
+                << ev.rx_kernel_ts_ns << ','
+                << ev.rx_user_read_ns << ','
+                << ev.loss_count << ','
+                << ev.cpu_id << ','
+                << ev.sched_policy << ','
+                << ev.sched_priority << '\n';
         }
     }
-    return idx;
+
+    while (q->pop(ev, g_stop)) {
+        if (ev.type == EventType::TX) {
+            tx_ofs
+                << "TX" << ','
+                << ev.host_event_ns << ','
+                << static_cast<unsigned>(ev.link_id) << ','
+                << static_cast<unsigned>(ev.task_id) << ','
+                << ev.ifname << ','
+                << ev.thread_name << ','
+                << ev.can_id << ','
+                << ev.seq << ','
+                << ev.nominal_period_ns << ','
+                << ev.planned_release_ns << ','
+                << ev.wakeup_ns << ','
+                << ev.send_call_ns << ','
+                << ev.send_ret << ','
+                << ev.cpu_id << ','
+                << ev.sched_policy << ','
+                << ev.sched_priority << '\n';
+        } else if (ev.type == EventType::RX || ev.type == EventType::LOSS) {
+            rx_ofs
+                << (ev.type == EventType::RX ? "RX" : "LOSS") << ','
+                << ev.host_event_ns << ','
+                << static_cast<unsigned>(ev.link_id) << ','
+                << static_cast<unsigned>(ev.task_id) << ','
+                << ev.ifname << ','
+                << ev.thread_name << ','
+                << ev.can_id << ','
+                << ev.seq << ','
+                << static_cast<unsigned>(ev.dlc) << ','
+                << ev.rx_kernel_ts_ns << ','
+                << ev.rx_user_read_ns << ','
+                << ev.loss_count << ','
+                << ev.cpu_id << ','
+                << ev.sched_policy << ','
+                << ev.sched_priority << '\n';
+        }
+    }
+
+    tx_ofs.flush();
+    rx_ofs.flush();
+    info_ofs.flush();
 }
 
-// =========================
-// CAN 发送线程
-// =========================
-static void tx_worker(TxWorkerArgs args) {
-    pthread_t tid = pthread_self();
+static void sleep_until_ns(uint64_t target_ns) {
+    while (!g_stop.load()) {
+        uint64_t now = now_monotonic_ns();
+        if (now >= target_ns) break;
+        uint64_t remain = target_ns - now;
+        struct timespec ts{};
+        ts.tv_sec = remain / 1000000000ull;
+        ts.tv_nsec = remain % 1000000000ull;
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);
+    }
+}
 
-    set_thread_affinity(tid, args.thread_cfg.cpu_core);
-    set_thread_sched(tid, args.thread_cfg.sched_policy, args.thread_cfg.sched_priority);
+static void tx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) {
+    apply_thread_rt(dir.tx_rt);
 
-    int sock = open_can_socket(args.ifname);
-    if (sock < 0) {
-        std::cerr << "[ERR] failed to open CAN socket on " << args.ifname << "\n";
+    int fd = open_can_socket(dir.tx_ifname, false, gcfg.tx_sock_sndbuf, 0);
+    if (fd < 0) {
+        EventRecord ev{};
+        ev.type = EventType::INFO;
+        ev.host_event_ns = now_monotonic_ns();
+        ev.link_id = dir.link_id;
+        copy_cstr(ev.ifname, sizeof(ev.ifname), dir.tx_ifname);
+        copy_cstr(ev.thread_name, sizeof(ev.thread_name), dir.tx_rt.name);
+        ev.send_ret = -1;
+        q->push(ev);
         return;
     }
 
-    std::cout << "[INFO] tx_worker start: " << args.thread_cfg.name
-              << " if=" << args.ifname
-              << " policy=" << sched_policy_name(args.thread_cfg.sched_policy)
-              << " prio=" << args.thread_cfg.sched_priority
-              << " core=" << args.thread_cfg.cpu_core << "\n";
+    std::vector<TaskRuntime> runtimes;
+    uint64_t start_ns = now_monotonic_ns() + 100000000ull;
+    for (const auto& t : dir.tasks) {
+        TaskRuntime rt;
+        rt.cfg = t;
+        rt.next_release_ns = start_ns;
+        rt.seq = 0;
+        runtimes.push_back(rt);
+    }
 
     while (!g_stop.load()) {
-        if (args.tasks.empty()) break;
-
-        size_t idx = find_earliest_task_index(args.tasks);
-        CanTask& task = args.tasks[idx];
-
-        uint64_t planned_release_ns = task.next_release_ns;
-        sleep_until_ns(planned_release_ns);
-
-        if (g_stop.load()) break;
-
-        uint64_t wakeup_ns = now_ns();
-
-        uint8_t data[8] = {0};
-        std::memcpy(&data[0], &task.seq, sizeof(task.seq));
-        data[4] = static_cast<uint8_t>(task.can_id & 0xFF);
-        data[5] = static_cast<uint8_t>((task.can_id >> 8) & 0xFF);
-        data[6] = static_cast<uint8_t>(task.observed ? 1 : 0);
-        data[7] = static_cast<uint8_t>(args.thread_cfg.name == "tx_can00" ? 0 : 1);
-
-        int send_ret = send_can_frame(sock, task.can_id, data, task.dlc);
-        uint64_t send_call_ns = now_ns();
-
-        TxRecord rec;
-        rec.exp_id = args.exp_id;
-        rec.thread_name = args.thread_cfg.name;
-        rec.ifname = args.ifname;
-        rec.can_id = task.can_id;
-        rec.seq = task.seq;
-        rec.nominal_period_ns = task.period_ns;
-        rec.planned_release_ns = planned_release_ns;
-        rec.wakeup_ns = wakeup_ns;
-        rec.send_call_ns = send_call_ns;
-        rec.send_ret = send_ret;
-        rec.cpu_id = current_cpu();
-        rec.sched_policy = args.thread_cfg.sched_policy;
-        rec.sched_priority = args.thread_cfg.sched_priority;
-
-        {
-            std::lock_guard<std::mutex> lock(g_log_mtx);
-            g_log_buffer.push_back(std::move(rec));
+        uint64_t nearest_ns = UINT64_MAX;
+        for (const auto& rt : runtimes) {
+            if (rt.next_release_ns < nearest_ns) nearest_ns = rt.next_release_ns;
         }
-        g_log_cv.notify_one();
+        sleep_until_ns(nearest_ns);
 
-        task.seq++;
-        task.next_release_ns += task.period_ns;
+        uint64_t wakeup_ns = now_monotonic_ns();
 
-        uint64_t now = now_ns();
-        while (task.next_release_ns < now - task.period_ns * 10ULL) {
-            task.next_release_ns += task.period_ns;
+        for (auto& rt : runtimes) {
+            if (wakeup_ns + 1000ull < rt.next_release_ns) continue;
+
+            struct can_frame frame{};
+            frame.can_id = rt.cfg.can_id;
+            frame.can_dlc = 8;
+
+            Payload8 p{};
+            p.seq = rt.seq;
+            p.task_id = rt.cfg.task_id;
+            p.link_id = dir.link_id;
+            p.flags = 0;
+            p.reserved = 0;
+
+            std::memcpy(frame.data, &p, sizeof(p));
+
+            uint64_t send_call_ns = now_monotonic_ns();
+            int ret = static_cast<int>(write(fd, &frame, sizeof(frame)));
+
+            EventRecord ev{};
+            ev.type = EventType::TX;
+            ev.host_event_ns = send_call_ns;
+            ev.link_id = dir.link_id;
+            ev.task_id = rt.cfg.task_id;
+            ev.can_id = rt.cfg.can_id;
+            ev.seq = rt.seq;
+            ev.nominal_period_ns = rt.cfg.period_ns;
+            ev.planned_release_ns = rt.next_release_ns;
+            ev.wakeup_ns = wakeup_ns;
+            ev.send_call_ns = send_call_ns;
+            ev.send_ret = ret;
+            ev.cpu_id = current_cpu();
+            ev.sched_policy = get_sched_policy_self();
+            ev.sched_priority = get_sched_priority_self();
+            copy_cstr(ev.ifname, sizeof(ev.ifname), dir.tx_ifname);
+            copy_cstr(ev.thread_name, sizeof(ev.thread_name), dir.tx_rt.name);
+            q->push(ev);
+
+            rt.seq++;
+            rt.next_release_ns += rt.cfg.period_ns;
+
+            while (rt.next_release_ns <= send_call_ns) {
+                rt.next_release_ns += rt.cfg.period_ns;
+            }
         }
     }
 
-    close(sock);
-    std::cout << "[INFO] tx_worker stop: " << args.thread_cfg.name << "\n";
+    close(fd);
 }
 
-// =========================
-// stress 线程
-// =========================
-static void busy_spin_ns(uint64_t duration_ns) {
-    uint64_t start = now_ns();
-    volatile double x = 1.0;
-    while (!g_stop.load()) {
-        for (int i = 0; i < 1000; ++i) {
-            x = x * 1.000001 + 0.000001;
-        }
-        if (now_ns() - start >= duration_ns) break;
-    }
+static uint64_t timespec_to_ns(const timespec& ts) {
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
 }
 
-static void stress_worker(StressWorkerArgs args) {
-    pthread_t tid = pthread_self();
+static void rx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) {
+    apply_thread_rt(dir.rx_rt);
 
-    set_thread_affinity(tid, args.cpu_core);
-
-    std::cout << "[INFO] stress_worker start: idx=" << args.index
-              << " core=" << args.cpu_core
-              << " busy_ratio=" << args.busy_ratio << "\n";
-
-    const uint64_t window_ns = 10ULL * 1000000ULL;
-    uint64_t busy_ns = window_ns * static_cast<uint64_t>(args.busy_ratio) / 100ULL;
-    uint64_t idle_ns = window_ns - busy_ns;
-
-    while (!g_stop.load()) {
-        if (busy_ns > 0) {
-            busy_spin_ns(busy_ns);
-        }
-        if (idle_ns > 0 && !g_stop.load()) {
-            std::this_thread::sleep_for(std::chrono::nanoseconds(idle_ns));
-        }
-    }
-
-    std::cout << "[INFO] stress_worker stop: idx=" << args.index << "\n";
-}
-
-// =========================
-// logger 线程
-// =========================
-static void logger_worker(const std::string& log_path) {
-    std::ofstream ofs(log_path);
-    if (!ofs.is_open()) {
-        std::cerr << "[ERR] failed to open log file: " << log_path << "\n";
+    int fd = open_can_socket(dir.rx_ifname, true, 0, gcfg.rx_sock_rcvbuf);
+    if (fd < 0) {
+        EventRecord ev{};
+        ev.type = EventType::INFO;
+        ev.host_event_ns = now_monotonic_ns();
+        ev.link_id = dir.link_id;
+        copy_cstr(ev.ifname, sizeof(ev.ifname), dir.rx_ifname);
+        copy_cstr(ev.thread_name, sizeof(ev.thread_name), dir.rx_rt.name);
+        ev.send_ret = -1;
+        q->push(ev);
         return;
     }
 
-    ofs << "exp_id,thread_name,ifname,can_id,seq,nominal_period_ns,"
-        << "planned_release_ns,wakeup_ns,send_call_ns,send_ret,cpu_id,"
-        << "sched_policy,sched_priority\n";
-
-    std::cout << "[INFO] logger start: " << log_path << "\n";
+    std::map<RxLastSeqKey, uint32_t> last_seq_map;
 
     while (!g_stop.load()) {
-        std::vector<TxRecord> local;
+        struct can_frame frame{};
+        struct iovec iov{};
+        iov.iov_base = &frame;
+        iov.iov_len = sizeof(frame);
 
-        {
-            std::unique_lock<std::mutex> lock(g_log_mtx);
-            g_log_cv.wait_for(lock, std::chrono::milliseconds(200), [] {
-                return !g_log_buffer.empty() || g_stop.load();
-            });
-            local.swap(g_log_buffer);
+        char ctrlmsg[256];
+        std::memset(ctrlmsg, 0, sizeof(ctrlmsg));
+
+        struct msghdr msg{};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = ctrlmsg;
+        msg.msg_controllen = sizeof(ctrlmsg);
+
+        int nbytes = static_cast<int>(recvmsg(fd, &msg, 0));
+        uint64_t rx_user_read_ns = now_monotonic_ns();
+
+        if (nbytes < 0) {
+            if (errno == EINTR) continue;
+            continue;
         }
 
-        for (const auto& r : local) {
-            ofs << r.exp_id << ","
-                << r.thread_name << ","
-                << r.ifname << ","
-                << "0x" << std::hex << std::uppercase << r.can_id << std::dec << ","
-                << r.seq << ","
-                << r.nominal_period_ns << ","
-                << r.planned_release_ns << ","
-                << r.wakeup_ns << ","
-                << r.send_call_ns << ","
-                << r.send_ret << ","
-                << r.cpu_id << ","
-                << r.sched_policy << ","
-                << r.sched_priority
-                << "\n";
+        if (nbytes < static_cast<int>(sizeof(struct can_frame))) {
+            continue;
         }
 
-        ofs.flush();
+        if (frame.can_dlc < 8) {
+            continue;
+        }
+
+        Payload8 p{};
+        std::memcpy(&p, frame.data, sizeof(p));
+
+        uint64_t rx_kernel_ts_ns = 0;
+
+        for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+             cmsg != nullptr;
+             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPNS) {
+                auto* ts = reinterpret_cast<struct timespec*>(CMSG_DATA(cmsg));
+                rx_kernel_ts_ns = timespec_to_ns(*ts);
+                break;
+            }
+        }
+
+        EventRecord ev{};
+        ev.type = EventType::RX;
+        ev.host_event_ns = rx_user_read_ns;
+        ev.link_id = p.link_id;
+        ev.task_id = p.task_id;
+        ev.dlc = frame.can_dlc;
+        ev.can_id = frame.can_id & CAN_EFF_MASK;
+        ev.seq = p.seq;
+        ev.rx_kernel_ts_ns = rx_kernel_ts_ns;
+        ev.rx_user_read_ns = rx_user_read_ns;
+        ev.cpu_id = current_cpu();
+        ev.sched_policy = get_sched_policy_self();
+        ev.sched_priority = get_sched_priority_self();
+        copy_cstr(ev.ifname, sizeof(ev.ifname), dir.rx_ifname);
+        copy_cstr(ev.thread_name, sizeof(ev.thread_name), dir.rx_rt.name);
+        q->push(ev);
+
+        RxLastSeqKey key{p.link_id, p.task_id};
+        auto it = last_seq_map.find(key);
+        if (it != last_seq_map.end()) {
+            uint32_t expected = it->second + 1;
+            if (p.seq > expected) {
+                EventRecord loss_ev{};
+                loss_ev.type = EventType::LOSS;
+                loss_ev.host_event_ns = rx_user_read_ns;
+                loss_ev.link_id = p.link_id;
+                loss_ev.task_id = p.task_id;
+                loss_ev.dlc = frame.can_dlc;
+                loss_ev.can_id = frame.can_id & CAN_EFF_MASK;
+                loss_ev.seq = p.seq;
+                loss_ev.rx_kernel_ts_ns = rx_kernel_ts_ns;
+                loss_ev.rx_user_read_ns = rx_user_read_ns;
+                loss_ev.loss_count = p.seq - expected;
+                loss_ev.cpu_id = current_cpu();
+                loss_ev.sched_policy = get_sched_policy_self();
+                loss_ev.sched_priority = get_sched_priority_self();
+                copy_cstr(loss_ev.ifname, sizeof(loss_ev.ifname), dir.rx_ifname);
+                copy_cstr(loss_ev.thread_name, sizeof(loss_ev.thread_name), dir.rx_rt.name);
+                q->push(loss_ev);
+            }
+        }
+        last_seq_map[key] = p.seq;
     }
 
-    {
-        std::vector<TxRecord> local;
-        {
-            std::lock_guard<std::mutex> lock(g_log_mtx);
-            local.swap(g_log_buffer);
-        }
-        for (const auto& r : local) {
-            ofs << r.exp_id << ","
-                << r.thread_name << ","
-                << r.ifname << ","
-                << "0x" << std::hex << std::uppercase << r.can_id << std::dec << ","
-                << r.seq << ","
-                << r.nominal_period_ns << ","
-                << r.planned_release_ns << ","
-                << r.wakeup_ns << ","
-                << r.send_call_ns << ","
-                << r.send_ret << ","
-                << r.cpu_id << ","
-                << r.sched_policy << ","
-                << r.sched_priority
-                << "\n";
-        }
-        ofs.flush();
-    }
-
-    std::cout << "[INFO] logger stop\n";
+    close(fd);
 }
 
-// =========================
-// 构建配置
-// =========================
-static AppConfig build_config_from_args(int argc, char* argv[]) {
-    AppConfig cfg;
+static void stress_thread_fn(ThreadRtConfig rt) {
+    apply_thread_rt(rt);
 
-    cfg.exp_id = static_cast<uint64_t>(get_arg_int(argc, argv, "--exp-id", 1));
-    cfg.duration_sec = get_arg_int(argc, argv, "--duration", 10);
-
-    cfg.can0_ifname = get_arg(argc, argv, "--can0", "can00");
-    cfg.can1_ifname = get_arg(argc, argv, "--can1", "can01");
-    cfg.log_path = get_arg(argc, argv, "--log", "output/output.csv");
-
-    std::string policy_str = get_arg(argc, argv, "--policy", "other");
-    int policy = parse_sched_policy(policy_str);
-
-    std::string affinity = get_arg(argc, argv, "--affinity", "none");
-    std::string stress = get_arg(argc, argv, "--stress", "off");
-    int stress_threads = get_arg_int(argc, argv, "--stress-threads", 2);
-
-    cfg.can0_thread_cfg.name = "tx_can00";
-    cfg.can0_thread_cfg.sched_policy = policy;
-    cfg.can0_thread_cfg.sched_priority = get_arg_int(argc, argv, "--priority0", policy == SCHED_OTHER ? 0 : 80);
-
-    cfg.can1_thread_cfg.name = "tx_can01";
-    cfg.can1_thread_cfg.sched_policy = policy;
-    cfg.can1_thread_cfg.sched_priority = get_arg_int(argc, argv, "--priority1", policy == SCHED_OTHER ? 0 : 78);
-
-    if (affinity == "split") {
-        cfg.can0_thread_cfg.cpu_core = 0;
-        cfg.can1_thread_cfg.cpu_core = 1;
-        cfg.stress_cfg.cpu_cores = {2, 3};
-    } else {
-        cfg.can0_thread_cfg.cpu_core = -1;
-        cfg.can1_thread_cfg.cpu_core = -1;
-        cfg.stress_cfg.cpu_cores = {};
+    volatile uint64_t x = 1;
+    while (!g_stop.load()) {
+        for (int i = 0; i < 200000; ++i) {
+            x = x * 1664525ull + 1013904223ull;
+        }
+        std::this_thread::yield();
     }
-
-    if (stress == "high") {
-        cfg.stress_cfg.thread_count = stress_threads;
-        cfg.stress_cfg.busy_ratio = 100;
-    } else {
-        cfg.stress_cfg.thread_count = 0;
-        cfg.stress_cfg.busy_ratio = 0;
-    }
-
-    cfg.can0_tasks = make_demo_tasks_can00();
-    cfg.can1_tasks = make_demo_tasks_can01();
-
-    return cfg;
+    (void)x;
 }
 
-// =========================
-// main
-// =========================
+static SchedKind parse_sched(const std::string& s) {
+    if (s == "fifo") return SchedKind::FIFO;
+    if (s == "rr") return SchedKind::RR;
+    return SchedKind::OTHER;
+}
+
+static void print_usage(const char* prog) {
+    std::cout
+        << "Usage:\n"
+        << prog << " [options]\n\n"
+        << "Options:\n"
+        << "  --duration SEC\n"
+        << "  --out-dir DIR\n"
+        << "  --policy other|fifo|rr\n"
+        << "  --tx-prio N\n"
+        << "  --rx-prio N\n"
+        << "  --cpu-map tx00,rx00,tx10,rx10,tx01,rx01,tx11,rx11\n"
+        << "  --stress-threads N\n"
+        << "  --stress-cpu-start N\n";
+}
+
+static std::vector<int> parse_cpu_map(const std::string& s) {
+    std::vector<int> out;
+    std::stringstream ss(s);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        out.push_back(std::stoi(item));
+    }
+    return out;
+}
+
 int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    AppConfig cfg = build_config_from_args(argc, argv);
+    GlobalConfig gcfg;
+    SchedKind common_policy = SchedKind::OTHER;
+    int tx_prio = 80;
+    int rx_prio = 70;
+    std::vector<int> cpu_map = {-1, -1, -1, -1, -1, -1, -1, -1};
 
-    std::cout << "========== dual CAN realtime sender ==========\n";
-    std::cout << "exp_id      : " << cfg.exp_id << "\n";
-    std::cout << "duration    : " << cfg.duration_sec << " s\n";
-    std::cout << "can0        : " << cfg.can0_ifname << "\n";
-    std::cout << "can1        : " << cfg.can1_ifname << "\n";
-    std::cout << "policy      : " << sched_policy_name(cfg.can0_thread_cfg.sched_policy) << "\n";
-    std::cout << "priority0   : " << cfg.can0_thread_cfg.sched_priority << "\n";
-    std::cout << "priority1   : " << cfg.can1_thread_cfg.sched_priority << "\n";
-    std::cout << "core(can0)  : " << cfg.can0_thread_cfg.cpu_core << "\n";
-    std::cout << "core(can1)  : " << cfg.can1_thread_cfg.cpu_core << "\n";
-    std::cout << "stress_cnt  : " << cfg.stress_cfg.thread_count << "\n";
-    std::cout << "stress_busy : " << cfg.stress_cfg.busy_ratio << "\n";
-    std::cout << "log_path    : " << cfg.log_path << "\n";
-    std::cout << "=============================================\n";
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--duration" && i + 1 < argc) {
+            gcfg.duration_sec = std::stoi(argv[++i]);
+        } else if (a == "--out-dir" && i + 1 < argc) {
+            gcfg.out_dir = argv[++i];
+        } else if (a == "--policy" && i + 1 < argc) {
+            common_policy = parse_sched(argv[++i]);
+        } else if (a == "--tx-prio" && i + 1 < argc) {
+            tx_prio = std::stoi(argv[++i]);
+        } else if (a == "--rx-prio" && i + 1 < argc) {
+            rx_prio = std::stoi(argv[++i]);
+        } else if (a == "--cpu-map" && i + 1 < argc) {
+            cpu_map = parse_cpu_map(argv[++i]);
+            if (cpu_map.size() != 8) {
+                std::cerr << "cpu-map requires 8 integers\n";
+                return 1;
+            }
+        } else if (a == "--stress-threads" && i + 1 < argc) {
+            gcfg.enable_stress = true;
+            gcfg.stress_threads = std::stoi(argv[++i]);
+        } else if (a == "--stress-cpu-start" && i + 1 < argc) {
+            gcfg.stress_cpu_start = std::stoi(argv[++i]);
+        } else if (a == "--help") {
+            print_usage(argv[0]);
+            return 0;
+        } else {
+            std::cerr << "Unknown arg: " << a << "\n";
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
 
-    std::thread logger_th(logger_worker, cfg.log_path);
+    ensure_dir(gcfg.out_dir);
 
-    TxWorkerArgs can0_args;
-    can0_args.exp_id = cfg.exp_id;
-    can0_args.ifname = cfg.can0_ifname;
-    can0_args.thread_cfg = cfg.can0_thread_cfg;
-    can0_args.tasks = cfg.can0_tasks;
+    std::vector<TaskConfig> tasks = {
+        {0, 0x100, 1'000'000ull},
+        {1, 0x101, 2'000'000ull},
+        {2, 0x102, 10'000'000ull},
+        {3, 0x103, 20'000'000ull}
+    };
 
-    TxWorkerArgs can1_args;
-    can1_args.exp_id = cfg.exp_id;
-    can1_args.ifname = cfg.can1_ifname;
-    can1_args.thread_cfg = cfg.can1_thread_cfg;
-    can1_args.tasks = cfg.can1_tasks;
+    DirectionConfig d0;
+    d0.link_id = 0;
+    d0.tx_ifname = "can00";
+    d0.rx_ifname = "can10";
+    d0.direction_name = "can00_to_can10";
+    d0.tx_rt = {"tx_can00", common_policy, tx_prio, cpu_map[0]};
+    d0.rx_rt = {"rx_can10", common_policy, rx_prio, cpu_map[1]};
+    d0.tasks = tasks;
 
-    std::thread can0_th(tx_worker, can0_args);
-    std::thread can1_th(tx_worker, can1_args);
+    DirectionConfig d1;
+    d1.link_id = 1;
+    d1.tx_ifname = "can10";
+    d1.rx_ifname = "can00";
+    d1.direction_name = "can10_to_can00";
+    d1.tx_rt = {"tx_can10", common_policy, tx_prio, cpu_map[2]};
+    d1.rx_rt = {"rx_can00", common_policy, rx_prio, cpu_map[3]};
+    d1.tasks = tasks;
+
+    DirectionConfig d2;
+    d2.link_id = 2;
+    d2.tx_ifname = "can01";
+    d2.rx_ifname = "can11";
+    d2.direction_name = "can01_to_can11";
+    d2.tx_rt = {"tx_can01", common_policy, tx_prio, cpu_map[4]};
+    d2.rx_rt = {"rx_can11", common_policy, rx_prio, cpu_map[5]};
+    d2.tasks = tasks;
+
+    DirectionConfig d3;
+    d3.link_id = 3;
+    d3.tx_ifname = "can11";
+    d3.rx_ifname = "can01";
+    d3.direction_name = "can11_to_can01";
+    d3.tx_rt = {"tx_can11", common_policy, tx_prio, cpu_map[6]};
+    d3.rx_rt = {"rx_can01", common_policy, rx_prio, cpu_map[7]};
+    d3.tasks = tasks;
+
+    EventQueue queue(1 << 20);
+
+    std::thread logger_thr(logger_thread_fn, &queue, gcfg.out_dir);
+
+    std::thread tx0(tx_thread_fn, d0, gcfg, &queue);
+    std::thread rx0(rx_thread_fn, d0, gcfg, &queue);
+
+    std::thread tx1(tx_thread_fn, d1, gcfg, &queue);
+    std::thread rx1(rx_thread_fn, d1, gcfg, &queue);
+
+    std::thread tx2(tx_thread_fn, d2, gcfg, &queue);
+    std::thread rx2(rx_thread_fn, d2, gcfg, &queue);
+
+    std::thread tx3(tx_thread_fn, d3, gcfg, &queue);
+    std::thread rx3(rx_thread_fn, d3, gcfg, &queue);
 
     std::vector<std::thread> stress_threads;
-    for (int i = 0; i < cfg.stress_cfg.thread_count; ++i) {
-        StressWorkerArgs sargs;
-        sargs.index = i;
-        sargs.busy_ratio = cfg.stress_cfg.busy_ratio;
-
-        if (!cfg.stress_cfg.cpu_cores.empty()) {
-            sargs.cpu_core = cfg.stress_cfg.cpu_cores[i % cfg.stress_cfg.cpu_cores.size()];
-        } else {
-            sargs.cpu_core = -1;
+    if (gcfg.enable_stress && gcfg.stress_threads > 0) {
+        for (int i = 0; i < gcfg.stress_threads; ++i) {
+            ThreadRtConfig rt;
+            rt.name = "stress" + std::to_string(i);
+            rt.policy = SchedKind::OTHER;
+            rt.priority = 0;
+            rt.cpu = (gcfg.stress_cpu_start >= 0) ? (gcfg.stress_cpu_start + i) : -1;
+            stress_threads.emplace_back(stress_thread_fn, rt);
         }
-
-        stress_threads.emplace_back(stress_worker, sargs);
     }
 
-    std::this_thread::sleep_for(std::chrono::seconds(cfg.duration_sec));
-
+    uint64_t t_end = now_monotonic_ns() + static_cast<uint64_t>(gcfg.duration_sec) * 1000000000ull;
+    while (!g_stop.load() && now_monotonic_ns() < t_end) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
     g_stop.store(true);
-    g_log_cv.notify_all();
 
-    for (auto& th : stress_threads) {
-        if (th.joinable()) th.join();
-    }
-    if (can0_th.joinable()) can0_th.join();
-    if (can1_th.joinable()) can1_th.join();
-    if (logger_th.joinable()) logger_th.join();
+    tx0.join();
+    rx0.join();
+    tx1.join();
+    rx1.join();
+    tx2.join();
+    rx2.join();
+    tx3.join();
+    rx3.join();
 
-    std::cout << "[INFO] experiment finished.\n";
+    for (auto& t : stress_threads) t.join();
+
+    logger_thr.join();
+
+    std::cout << "Done. Logs written to: " << gcfg.out_dir << "\n";
+    std::cout << "Queue dropped events: " << queue.dropped() << "\n";
     return 0;
 }

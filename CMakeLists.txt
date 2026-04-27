@@ -1,15 +1,22 @@
-cmake_minimum_required(VERSION 3.10)
-project(dual_can_rt_v1)
+cmake_minimum_required(VERSION 3.16)
+project(rpi_can_loop_rt LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include_directories(include)
-
-add_executable(dual_can_rt
+add_executable(rpi_can_loop_rt
     src/main.cpp
 )
 
-target_link_libraries(dual_can_rt
+target_include_directories(rpi_can_loop_rt PRIVATE include)
+
+target_compile_options(rpi_can_loop_rt PRIVATE
+    -O2
+    -Wall
+    -Wextra
+    -pthread
+)
+
+target_link_libraries(rpi_can_loop_rt
     pthread
 )

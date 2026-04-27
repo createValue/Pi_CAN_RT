@@ -39,3 +39,14 @@
 
 # debug information files
 *.dwo
+
+# build output
+build/
+output/*.csv
+
+# analysis results
+analysis/results/**
+
+# python cache
+__pycache__/
+*.pyc
