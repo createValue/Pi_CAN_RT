@@ -1,0 +1,1 @@
+event_type,host_event_ns,link_id,task_id,ifname,thread_name,can_id,seq,nominal_period_ns,planned_release_ns,wakeup_ns,send_call_ns,send_ret,rx_kernel_ts_ns,rx_user_read_ns,loss_count,cpu_id,sched_policy,sched_priority,message
