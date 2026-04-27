@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -32,7 +33,6 @@
 
 #include <linux/can.h>
 #include <linux/can/raw.h>
-#include <linux/if.h>
 #include <net/if.h>
 
 enum class EventType : uint8_t {
@@ -166,14 +166,7 @@ inline uint64_t now_monotonic_ns() {
 }
 
 inline int current_cpu() {
-#ifdef SYS_getcpu
-    unsigned cpu = 0;
-    unsigned node = 0;
-    syscall(SYS_getcpu, &cpu, &node, nullptr);
-    return static_cast<int>(cpu);
-#else
     return sched_getcpu();
-#endif
 }
 
 inline int get_sched_policy_self() {
