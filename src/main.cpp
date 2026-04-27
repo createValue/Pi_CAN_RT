@@ -11,6 +11,7 @@ struct TaskRuntime {
 struct RxLastSeqKey {
     uint8_t link_id;
     uint8_t task_id;
+
     bool operator<(const RxLastSeqKey& other) const {
         if (link_id != other.link_id) return link_id < other.link_id;
         return task_id < other.task_id;
@@ -42,7 +43,7 @@ static void write_csv_header_info(std::ofstream& ofs) {
     ofs << "event_type,host_event_ns,link_id,task_id,ifname,thread_name,can_id,seq,"
            "nominal_period_ns,planned_release_ns,wakeup_ns,send_call_ns,send_ret,"
            "rx_kernel_ts_ns,rx_user_read_ns,loss_count,"
-           "cpu_id,sched_policy,sched_priority\n";
+           "cpu_id,sched_policy,sched_priority,message\n";
 }
 
 static void logger_thread_fn(EventQueue* q, const std::string out_dir) {
@@ -115,11 +116,12 @@ static void logger_thread_fn(EventQueue* q, const std::string out_dir) {
                 << ev.loss_count << ','
                 << ev.cpu_id << ','
                 << ev.sched_policy << ','
-                << ev.sched_priority << '\n';
+                << ev.sched_priority << ','
+                << '"' << ev.thread_name << '"' << '\n';
         }
     }
 
-    while (q->pop(ev, g_stop)) {
+    while (q->drain_one(ev)) {
         if (ev.type == EventType::TX) {
             tx_ofs
                 << "TX" << ','
@@ -167,32 +169,41 @@ static void sleep_until_ns(uint64_t target_ns) {
     while (!g_stop.load()) {
         uint64_t now = now_monotonic_ns();
         if (now >= target_ns) break;
+
         uint64_t remain = target_ns - now;
         struct timespec ts{};
         ts.tv_sec = remain / 1000000000ull;
         ts.tv_nsec = remain % 1000000000ull;
+
         clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);
     }
 }
 
+static void print_thread_status(const ThreadRtConfig& cfg, const std::string& role) {
+    std::cout
+        << "[THREAD] " << role
+        << " name=" << cfg.name
+        << " target_policy=" << sched_kind_name(cfg.policy)
+        << " target_priority=" << ((cfg.policy == SchedKind::OTHER) ? 0 : cfg.priority)
+        << " target_cpu=" << cfg.cpu
+        << " actual_policy=" << sched_policy_name(get_sched_policy_self())
+        << " actual_priority=" << get_sched_priority_self()
+        << " actual_cpu=" << current_cpu()
+        << "\n";
+}
+
 static void tx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) {
     apply_thread_rt(dir.tx_rt);
+    print_thread_status(dir.tx_rt, "TX");
 
     int fd = open_can_socket(dir.tx_ifname, false, gcfg.tx_sock_sndbuf, 0);
     if (fd < 0) {
-        EventRecord ev{};
-        ev.type = EventType::INFO;
-        ev.host_event_ns = now_monotonic_ns();
-        ev.link_id = dir.link_id;
-        copy_cstr(ev.ifname, sizeof(ev.ifname), dir.tx_ifname);
-        copy_cstr(ev.thread_name, sizeof(ev.thread_name), dir.tx_rt.name);
-        ev.send_ret = -1;
-        q->push(ev);
         return;
     }
 
     std::vector<TaskRuntime> runtimes;
     uint64_t start_ns = now_monotonic_ns() + 100000000ull;
+
     for (const auto& t : dir.tasks) {
         TaskRuntime rt;
         rt.cfg = t;
@@ -206,8 +217,8 @@ static void tx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
         for (const auto& rt : runtimes) {
             if (rt.next_release_ns < nearest_ns) nearest_ns = rt.next_release_ns;
         }
-        sleep_until_ns(nearest_ns);
 
+        sleep_until_ns(nearest_ns);
         uint64_t wakeup_ns = now_monotonic_ns();
 
         for (auto& rt : runtimes) {
@@ -260,23 +271,12 @@ static void tx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
     close(fd);
 }
 
-static uint64_t timespec_to_ns(const timespec& ts) {
-    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
-}
-
 static void rx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) {
     apply_thread_rt(dir.rx_rt);
+    print_thread_status(dir.rx_rt, "RX");
 
     int fd = open_can_socket(dir.rx_ifname, true, 0, gcfg.rx_sock_rcvbuf);
     if (fd < 0) {
-        EventRecord ev{};
-        ev.type = EventType::INFO;
-        ev.host_event_ns = now_monotonic_ns();
-        ev.link_id = dir.link_id;
-        copy_cstr(ev.ifname, sizeof(ev.ifname), dir.rx_ifname);
-        copy_cstr(ev.thread_name, sizeof(ev.thread_name), dir.rx_rt.name);
-        ev.send_ret = -1;
-        q->push(ev);
         return;
     }
 
@@ -305,13 +305,8 @@ static void rx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
             continue;
         }
 
-        if (nbytes < static_cast<int>(sizeof(struct can_frame))) {
-            continue;
-        }
-
-        if (frame.can_dlc < 8) {
-            continue;
-        }
+        if (nbytes < static_cast<int>(sizeof(struct can_frame))) continue;
+        if (frame.can_dlc < 8) continue;
 
         Payload8 p{};
         std::memcpy(&p, frame.data, sizeof(p));
@@ -377,6 +372,7 @@ static void rx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
 
 static void stress_thread_fn(ThreadRtConfig rt) {
     apply_thread_rt(rt);
+    print_thread_status(rt, "STRESS");
 
     volatile uint64_t x = 1;
     while (!g_stop.load()) {
@@ -404,7 +400,7 @@ static void print_usage(const char* prog) {
         << "  --policy other|fifo|rr\n"
         << "  --tx-prio N\n"
         << "  --rx-prio N\n"
-        << "  --cpu-map tx00,rx00,tx10,rx10,tx01,rx01,tx11,rx11\n"
+        << "  --cpu-map tx00,rx10,tx10,rx00,tx01,rx11,tx11,rx01\n"
         << "  --stress-threads N\n"
         << "  --stress-cpu-start N\n";
 }
@@ -425,12 +421,13 @@ int main(int argc, char* argv[]) {
 
     GlobalConfig gcfg;
     SchedKind common_policy = SchedKind::OTHER;
-    int tx_prio = 80;
-    int rx_prio = 70;
+    int tx_prio = 0;
+    int rx_prio = 0;
     std::vector<int> cpu_map = {-1, -1, -1, -1, -1, -1, -1, -1};
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
+
         if (a == "--duration" && i + 1 < argc) {
             gcfg.duration_sec = std::stoi(argv[++i]);
         } else if (a == "--out-dir" && i + 1 < argc) {
@@ -462,7 +459,19 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (common_policy == SchedKind::OTHER) {
+        tx_prio = 0;
+        rx_prio = 0;
+    }
+
     ensure_dir(gcfg.out_dir);
+
+    std::cout << "[CONFIG] duration_sec=" << gcfg.duration_sec << "\n";
+    std::cout << "[CONFIG] out_dir=" << gcfg.out_dir << "\n";
+    std::cout << "[CONFIG] policy=" << sched_kind_name(common_policy) << "\n";
+    std::cout << "[CONFIG] tx_prio=" << tx_prio << "\n";
+    std::cout << "[CONFIG] rx_prio=" << rx_prio << "\n";
+    std::cout << "[CONFIG] stress_threads=" << gcfg.stress_threads << "\n";
 
     std::vector<TaskConfig> tasks = {
         {0, 0x100, 1'000'000ull},
@@ -550,11 +559,14 @@ int main(int argc, char* argv[]) {
     tx3.join();
     rx3.join();
 
-    for (auto& t : stress_threads) t.join();
+    for (auto& t : stress_threads) {
+        t.join();
+    }
 
     logger_thr.join();
 
-    std::cout << "Done. Logs written to: " << gcfg.out_dir << "\n";
-    std::cout << "Queue dropped events: " << queue.dropped() << "\n";
+    std::cout << "[DONE] Logs written to: " << gcfg.out_dir << "\n";
+    std::cout << "[DONE] Queue dropped events: " << queue.dropped() << "\n";
+
     return 0;
 }

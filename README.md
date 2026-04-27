@@ -29,9 +29,7 @@ cmake ..
 make -j
 ```
 
-## 运行前配置 CAN
-例如：
-
+## CAN 配置
 ```bash
 sudo ip link set can00 down
 sudo ip link set can01 down
@@ -46,23 +44,43 @@ sudo ip link set can11 up type can bitrate 1000000
 
 ## 运行示例
 
-### 普通调度
+### 1. 基线：普通调度
 ```bash
 ./rpi_can_loop_rt --duration 20 --out-dir ../output/run_other
 ```
 
-### FIFO 调度 + 绑核
+### 2. FIFO
 ```bash
 sudo ./rpi_can_loop_rt \
   --duration 20 \
   --out-dir ../output/run_fifo \
   --policy fifo \
   --tx-prio 80 \
+  --rx-prio 70
+```
+
+### 3. RR
+```bash
+sudo ./rpi_can_loop_rt \
+  --duration 20 \
+  --out-dir ../output/run_rr \
+  --policy rr \
+  --tx-prio 80 \
+  --rx-prio 70
+```
+
+### 4. FIFO + 绑核
+```bash
+sudo ./rpi_can_loop_rt \
+  --duration 20 \
+  --out-dir ../output/run_fifo_aff \
+  --policy fifo \
+  --tx-prio 80 \
   --rx-prio 70 \
   --cpu-map 0,1,2,3,0,1,2,3
 ```
 
-### 加 CPU 干扰
+### 5. FIFO + stress
 ```bash
 sudo ./rpi_can_loop_rt \
   --duration 20 \
@@ -75,50 +93,20 @@ sudo ./rpi_can_loop_rt \
   --stress-cpu-start 2
 ```
 
-## 输出文件
+## 日志文件
 - `tx_log.csv`
 - `rx_log.csv`
 - `info_log.csv`
 
-## TX 日志字段
-- `link_id`
-- `task_id`
-- `ifname`
-- `thread_name`
-- `can_id`
-- `seq`
-- `nominal_period_ns`
-- `planned_release_ns`
-- `wakeup_ns`
-- `send_call_ns`
-- `send_ret`
-- `cpu_id`
-- `sched_policy`
-- `sched_priority`
-
-## RX 日志字段
-- `link_id`
-- `task_id`
-- `ifname`
-- `thread_name`
-- `can_id`
-- `seq`
-- `dlc`
-- `rx_kernel_ts_ns`
-- `rx_user_read_ns`
-- `loss_count`
-- `cpu_id`
-- `sched_policy`
-- `sched_priority`
-
 ## 方法学说明
+
 ### 主指标
-建议优先分析：
+优先分析：
 - `rx_kernel_period_jitter_ns`
 - `rx_user_period_jitter_ns`
 
-### 原因解释指标
-- `tx_wakeup_latency_ns`
+### 解释指标
+- `tx_wakeup_latency_ns = wakeup_ns - planned_release_ns`
 - `tx_path_delay_ns = send_call_ns - wakeup_ns`
 - `tx_lateness_ns = send_call_ns - planned_release_ns`
 - `tx2rx_kernel_latency_ns = rx_kernel_ts_ns - send_call_ns`
@@ -126,5 +114,5 @@ sudo ./rpi_can_loop_rt \
 - `end2end_user_lateness_ns = rx_user_read_ns - planned_release_ns`
 
 ### 丢帧处理
-仅当 `seq(k) - seq(k-1) = 1` 时，才把该样本纳入周期 jitter 统计。  
-若 `seq` 跳变大于 1，则记为丢帧事件，并将该区间从正常 jitter 统计中剔除。
+只在 `seq` 连续时统计周期 jitter。  
+若 `seq` 跳变，则该区间视为丢帧，不纳入正常 jitter 统计。

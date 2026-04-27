@@ -12,7 +12,6 @@
 #include <iostream>
 #include <map>
 #include <mutex>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -22,7 +21,6 @@
 #include <csignal>
 #include <cstdlib>
 
-#include <fcntl.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/ioctl.h>
@@ -149,6 +147,14 @@ public:
         return true;
     }
 
+    bool drain_one(EventRecord& out) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        if (q_.empty()) return false;
+        out = q_.front();
+        q_.pop_front();
+        return true;
+    }
+
     uint64_t dropped() const { return dropped_.load(); }
 
 private:
@@ -162,6 +168,10 @@ private:
 inline uint64_t now_monotonic_ns() {
     struct timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
+}
+
+inline uint64_t timespec_to_ns(const struct timespec& ts) {
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
 }
 
@@ -193,29 +203,54 @@ inline int sched_kind_to_native(SchedKind k) {
     }
 }
 
+inline std::string sched_kind_name(SchedKind k) {
+    switch (k) {
+        case SchedKind::FIFO: return "FIFO";
+        case SchedKind::RR: return "RR";
+        case SchedKind::OTHER:
+        default: return "OTHER";
+    }
+}
+
+inline std::string sched_policy_name(int p) {
+    switch (p) {
+        case SCHED_FIFO: return "FIFO";
+        case SCHED_RR: return "RR";
+        case SCHED_OTHER: return "OTHER";
+        default: return "UNKNOWN";
+    }
+}
+
 inline bool apply_thread_rt(const ThreadRtConfig& cfg) {
     pthread_t tid = pthread_self();
+
+    if (!cfg.name.empty()) {
+        pthread_setname_np(tid, cfg.name.substr(0, 15).c_str());
+    }
 
     if (cfg.cpu >= 0) {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         CPU_SET(cfg.cpu, &cpuset);
         if (pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset) != 0) {
-            std::perror("pthread_setaffinity_np");
+            std::cerr << "[WARN] " << cfg.name << " pthread_setaffinity_np failed: "
+                      << std::strerror(errno) << "\n";
         }
     }
 
     int policy = sched_kind_to_native(cfg.policy);
     struct sched_param sp{};
-    sp.sched_priority = cfg.priority;
+    sp.sched_priority = (policy == SCHED_OTHER) ? 0 : cfg.priority;
 
     if (pthread_setschedparam(tid, policy, &sp) != 0) {
-        std::perror("pthread_setschedparam");
+        int err = errno;
+        std::cerr << "[WARN] " << cfg.name
+                  << " pthread_setschedparam failed"
+                  << " policy=" << sched_kind_name(cfg.policy)
+                  << " priority=" << sp.sched_priority
+                  << " errno=" << err
+                  << " (" << std::strerror(err) << ")\n";
         return false;
-    }
-
-    if (!cfg.name.empty()) {
-        pthread_setname_np(tid, cfg.name.substr(0, 15).c_str());
     }
 
     return true;
@@ -271,13 +306,4 @@ inline int open_can_socket(const std::string& ifname, bool enable_timestamp, int
     }
 
     return fd;
-}
-
-inline std::string sched_policy_name(int p) {
-    switch (p) {
-        case SCHED_FIFO: return "FIFO";
-        case SCHED_RR: return "RR";
-        case SCHED_OTHER: return "OTHER";
-        default: return "UNKNOWN";
-    }
 }
