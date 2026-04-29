@@ -46,6 +46,69 @@ static void write_csv_header_info(std::ofstream& ofs) {
            "cpu_id,sched_policy,sched_priority,message\n";
 }
 
+static void logger_write_tx(std::ofstream& ofs, const EventRecord& ev) {
+    ofs
+        << "TX" << ','
+        << ev.host_event_ns << ','
+        << static_cast<unsigned>(ev.link_id) << ','
+        << static_cast<unsigned>(ev.task_id) << ','
+        << ev.ifname << ','
+        << ev.thread_name << ','
+        << ev.can_id << ','
+        << ev.seq << ','
+        << ev.nominal_period_ns << ','
+        << ev.planned_release_ns << ','
+        << ev.wakeup_ns << ','
+        << ev.send_call_ns << ','
+        << ev.send_ret << ','
+        << ev.cpu_id << ','
+        << ev.sched_policy << ','
+        << ev.sched_priority << '\n';
+}
+
+static void logger_write_rx(std::ofstream& ofs, const EventRecord& ev) {
+    ofs
+        << (ev.type == EventType::RX ? "RX" : "LOSS") << ','
+        << ev.host_event_ns << ','
+        << static_cast<unsigned>(ev.link_id) << ','
+        << static_cast<unsigned>(ev.task_id) << ','
+        << ev.ifname << ','
+        << ev.thread_name << ','
+        << ev.can_id << ','
+        << ev.seq << ','
+        << static_cast<unsigned>(ev.dlc) << ','
+        << ev.rx_kernel_ts_ns << ','
+        << ev.rx_user_read_ns << ','
+        << ev.loss_count << ','
+        << ev.cpu_id << ','
+        << ev.sched_policy << ','
+        << ev.sched_priority << '\n';
+}
+
+static void logger_write_info(std::ofstream& ofs, const EventRecord& ev, const std::string& msg) {
+    ofs
+        << "INFO" << ','
+        << ev.host_event_ns << ','
+        << static_cast<unsigned>(ev.link_id) << ','
+        << static_cast<unsigned>(ev.task_id) << ','
+        << ev.ifname << ','
+        << ev.thread_name << ','
+        << ev.can_id << ','
+        << ev.seq << ','
+        << ev.nominal_period_ns << ','
+        << ev.planned_release_ns << ','
+        << ev.wakeup_ns << ','
+        << ev.send_call_ns << ','
+        << ev.send_ret << ','
+        << ev.rx_kernel_ts_ns << ','
+        << ev.rx_user_read_ns << ','
+        << ev.loss_count << ','
+        << ev.cpu_id << ','
+        << ev.sched_policy << ','
+        << ev.sched_priority << ','
+        << '"' << msg << '"' << '\n';
+}
+
 static void logger_thread_fn(EventQueue* q, const std::string out_dir) {
     ensure_dir(out_dir);
 
@@ -62,101 +125,21 @@ static void logger_thread_fn(EventQueue* q, const std::string out_dir) {
         if (!q->pop(ev, g_stop)) continue;
 
         if (ev.type == EventType::TX) {
-            tx_ofs
-                << "TX" << ','
-                << ev.host_event_ns << ','
-                << static_cast<unsigned>(ev.link_id) << ','
-                << static_cast<unsigned>(ev.task_id) << ','
-                << ev.ifname << ','
-                << ev.thread_name << ','
-                << ev.can_id << ','
-                << ev.seq << ','
-                << ev.nominal_period_ns << ','
-                << ev.planned_release_ns << ','
-                << ev.wakeup_ns << ','
-                << ev.send_call_ns << ','
-                << ev.send_ret << ','
-                << ev.cpu_id << ','
-                << ev.sched_policy << ','
-                << ev.sched_priority << '\n';
+            logger_write_tx(tx_ofs, ev);
         } else if (ev.type == EventType::RX || ev.type == EventType::LOSS) {
-            rx_ofs
-                << (ev.type == EventType::RX ? "RX" : "LOSS") << ','
-                << ev.host_event_ns << ','
-                << static_cast<unsigned>(ev.link_id) << ','
-                << static_cast<unsigned>(ev.task_id) << ','
-                << ev.ifname << ','
-                << ev.thread_name << ','
-                << ev.can_id << ','
-                << ev.seq << ','
-                << static_cast<unsigned>(ev.dlc) << ','
-                << ev.rx_kernel_ts_ns << ','
-                << ev.rx_user_read_ns << ','
-                << ev.loss_count << ','
-                << ev.cpu_id << ','
-                << ev.sched_policy << ','
-                << ev.sched_priority << '\n';
+            logger_write_rx(rx_ofs, ev);
         } else {
-            info_ofs
-                << "INFO" << ','
-                << ev.host_event_ns << ','
-                << static_cast<unsigned>(ev.link_id) << ','
-                << static_cast<unsigned>(ev.task_id) << ','
-                << ev.ifname << ','
-                << ev.thread_name << ','
-                << ev.can_id << ','
-                << ev.seq << ','
-                << ev.nominal_period_ns << ','
-                << ev.planned_release_ns << ','
-                << ev.wakeup_ns << ','
-                << ev.send_call_ns << ','
-                << ev.send_ret << ','
-                << ev.rx_kernel_ts_ns << ','
-                << ev.rx_user_read_ns << ','
-                << ev.loss_count << ','
-                << ev.cpu_id << ','
-                << ev.sched_policy << ','
-                << ev.sched_priority << ','
-                << '"' << ev.thread_name << '"' << '\n';
+            logger_write_info(info_ofs, ev, ev.thread_name);
         }
     }
 
     while (q->drain_one(ev)) {
         if (ev.type == EventType::TX) {
-            tx_ofs
-                << "TX" << ','
-                << ev.host_event_ns << ','
-                << static_cast<unsigned>(ev.link_id) << ','
-                << static_cast<unsigned>(ev.task_id) << ','
-                << ev.ifname << ','
-                << ev.thread_name << ','
-                << ev.can_id << ','
-                << ev.seq << ','
-                << ev.nominal_period_ns << ','
-                << ev.planned_release_ns << ','
-                << ev.wakeup_ns << ','
-                << ev.send_call_ns << ','
-                << ev.send_ret << ','
-                << ev.cpu_id << ','
-                << ev.sched_policy << ','
-                << ev.sched_priority << '\n';
+            logger_write_tx(tx_ofs, ev);
         } else if (ev.type == EventType::RX || ev.type == EventType::LOSS) {
-            rx_ofs
-                << (ev.type == EventType::RX ? "RX" : "LOSS") << ','
-                << ev.host_event_ns << ','
-                << static_cast<unsigned>(ev.link_id) << ','
-                << static_cast<unsigned>(ev.task_id) << ','
-                << ev.ifname << ','
-                << ev.thread_name << ','
-                << ev.can_id << ','
-                << ev.seq << ','
-                << static_cast<unsigned>(ev.dlc) << ','
-                << ev.rx_kernel_ts_ns << ','
-                << ev.rx_user_read_ns << ','
-                << ev.loss_count << ','
-                << ev.cpu_id << ','
-                << ev.sched_policy << ','
-                << ev.sched_priority << '\n';
+            logger_write_rx(rx_ofs, ev);
+        } else {
+            logger_write_info(info_ofs, ev, ev.thread_name);
         }
     }
 
@@ -174,7 +157,6 @@ static void sleep_until_ns(uint64_t target_ns) {
         struct timespec ts{};
         ts.tv_sec = remain / 1000000000ull;
         ts.tv_nsec = remain % 1000000000ull;
-
         clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);
     }
 }
@@ -196,7 +178,7 @@ static void tx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
     apply_thread_rt(dir.tx_rt);
     print_thread_status(dir.tx_rt, "TX");
 
-    int fd = open_can_socket(dir.tx_ifname, false, gcfg.tx_sock_sndbuf, 0);
+    int fd = open_can_socket(dir.tx_ifname, false, gcfg.tx_sock_sndbuf, 0, false);
     if (fd < 0) {
         return;
     }
@@ -219,10 +201,13 @@ static void tx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
         }
 
         sleep_until_ns(nearest_ns);
+        if (g_stop.load()) break;
+
         uint64_t wakeup_ns = now_monotonic_ns();
 
         for (auto& rt : runtimes) {
             if (wakeup_ns + 1000ull < rt.next_release_ns) continue;
+            if (g_stop.load()) break;
 
             struct can_frame frame{};
             frame.can_id = rt.cfg.can_id;
@@ -275,7 +260,7 @@ static void rx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
     apply_thread_rt(dir.rx_rt);
     print_thread_status(dir.rx_rt, "RX");
 
-    int fd = open_can_socket(dir.rx_ifname, true, 0, gcfg.rx_sock_rcvbuf);
+    int fd = open_can_socket(dir.rx_ifname, true, 0, gcfg.rx_sock_rcvbuf, true);
     if (fd < 0) {
         return;
     }
@@ -302,6 +287,7 @@ static void rx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
 
         if (nbytes < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
             continue;
         }
 
@@ -312,7 +298,6 @@ static void rx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
         std::memcpy(&p, frame.data, sizeof(p));
 
         uint64_t rx_kernel_ts_ns = 0;
-
         for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
              cmsg != nullptr;
              cmsg = CMSG_NXTHDR(&msg, cmsg)) {
@@ -473,14 +458,33 @@ int main(int argc, char* argv[]) {
     std::cout << "[CONFIG] rx_prio=" << rx_prio << "\n";
     std::cout << "[CONFIG] stress_threads=" << gcfg.stress_threads << "\n";
 
-    // 创建任务配置的辅助函数，每个方向使用不同的CAN ID偏移
-    auto create_tasks_for_direction = [](uint32_t can_id_base) -> std::vector<TaskConfig> {
-        return {
-            {0, can_id_base + 0x00, 1'000'000ull},   // 任务0：1ms周期
-            {1, can_id_base + 0x01, 2'000'000ull},   // 任务1：2ms周期
-            {2, can_id_base + 0x02, 10'000'000ull},  // 任务2：10ms周期
-            {3, can_id_base + 0x03, 20'000'000ull}   // 任务3：20ms周期
-        };
+    // 每个方向独立 CAN ID，避免同一物理总线双向 ID 冲突
+    std::vector<TaskConfig> tasks_d0 = {
+        {0, 0x100, 1'000'000ull},
+        {1, 0x101, 2'000'000ull},
+        {2, 0x102, 10'000'000ull},
+        {3, 0x103, 20'000'000ull}
+    };
+
+    std::vector<TaskConfig> tasks_d1 = {
+        {0, 0x110, 1'000'000ull},
+        {1, 0x111, 2'000'000ull},
+        {2, 0x112, 10'000'000ull},
+        {3, 0x113, 20'000'000ull}
+    };
+
+    std::vector<TaskConfig> tasks_d2 = {
+        {0, 0x120, 1'000'000ull},
+        {1, 0x121, 2'000'000ull},
+        {2, 0x122, 10'000'000ull},
+        {3, 0x123, 20'000'000ull}
+    };
+
+    std::vector<TaskConfig> tasks_d3 = {
+        {0, 0x130, 1'000'000ull},
+        {1, 0x131, 2'000'000ull},
+        {2, 0x132, 10'000'000ull},
+        {3, 0x133, 20'000'000ull}
     };
 
     DirectionConfig d0;
@@ -490,7 +494,7 @@ int main(int argc, char* argv[]) {
     d0.direction_name = "can00_to_can10";
     d0.tx_rt = {"tx_can00", common_policy, tx_prio, cpu_map[0]};
     d0.rx_rt = {"rx_can10", common_policy, rx_prio, cpu_map[1]};
-    d0.tasks = create_tasks_for_direction(0x100);
+    d0.tasks = tasks_d0;
 
     DirectionConfig d1;
     d1.link_id = 1;
@@ -499,7 +503,7 @@ int main(int argc, char* argv[]) {
     d1.direction_name = "can10_to_can00";
     d1.tx_rt = {"tx_can10", common_policy, tx_prio, cpu_map[2]};
     d1.rx_rt = {"rx_can00", common_policy, rx_prio, cpu_map[3]};
-    d1.tasks = create_tasks_for_direction(0x200);
+    d1.tasks = tasks_d1;
 
     DirectionConfig d2;
     d2.link_id = 2;
@@ -508,7 +512,7 @@ int main(int argc, char* argv[]) {
     d2.direction_name = "can01_to_can11";
     d2.tx_rt = {"tx_can01", common_policy, tx_prio, cpu_map[4]};
     d2.rx_rt = {"rx_can11", common_policy, rx_prio, cpu_map[5]};
-    d1.tasks = create_tasks_for_direction(0x300);
+    d2.tasks = tasks_d2;
 
     DirectionConfig d3;
     d3.link_id = 3;
@@ -517,7 +521,7 @@ int main(int argc, char* argv[]) {
     d3.direction_name = "can11_to_can01";
     d3.tx_rt = {"tx_can11", common_policy, tx_prio, cpu_map[6]};
     d3.rx_rt = {"rx_can01", common_policy, rx_prio, cpu_map[7]};
-    d3.tasks = create_tasks_for_direction(0x400);
+    d3.tasks = tasks_d3;
 
     EventQueue queue(1 << 20);
 
@@ -551,6 +555,7 @@ int main(int argc, char* argv[]) {
     while (!g_stop.load() && now_monotonic_ns() < t_end) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+
     g_stop.store(true);
 
     tx0.join();

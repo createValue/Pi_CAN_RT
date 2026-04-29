@@ -26,6 +26,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -256,7 +257,11 @@ inline bool apply_thread_rt(const ThreadRtConfig& cfg) {
     return true;
 }
 
-inline int open_can_socket(const std::string& ifname, bool enable_timestamp, int sndbuf, int rcvbuf) {
+inline int open_can_socket(const std::string& ifname,
+                           bool enable_timestamp,
+                           int sndbuf,
+                           int rcvbuf,
+                           bool set_recv_timeout) {
     int fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (fd < 0) {
         std::perror("socket(PF_CAN)");
@@ -284,6 +289,15 @@ inline int open_can_socket(const std::string& ifname, bool enable_timestamp, int
         int one = 1;
         if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof(one)) < 0) {
             std::perror("setsockopt(SO_TIMESTAMPNS)");
+        }
+    }
+
+    if (set_recv_timeout) {
+        struct timeval tv{};
+        tv.tv_sec = 0;
+        tv.tv_usec = 200000; // 200 ms
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+            std::perror("setsockopt(SO_RCVTIMEO)");
         }
     }
 
