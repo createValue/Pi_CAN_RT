@@ -473,11 +473,14 @@ int main(int argc, char* argv[]) {
     std::cout << "[CONFIG] rx_prio=" << rx_prio << "\n";
     std::cout << "[CONFIG] stress_threads=" << gcfg.stress_threads << "\n";
 
-    std::vector<TaskConfig> tasks = {
-        {0, 0x100, 1'000'000ull},
-        {1, 0x101, 2'000'000ull},
-        {2, 0x102, 10'000'000ull},
-        {3, 0x103, 20'000'000ull}
+    // 创建任务配置的辅助函数，每个方向使用不同的CAN ID偏移
+    auto create_tasks_for_direction = [](uint32_t can_id_base) -> std::vector<TaskConfig> {
+        return {
+            {0, can_id_base + 0x00, 1'000'000ull},   // 任务0：1ms周期
+            {1, can_id_base + 0x01, 2'000'000ull},   // 任务1：2ms周期
+            {2, can_id_base + 0x02, 10'000'000ull},  // 任务2：10ms周期
+            {3, can_id_base + 0x03, 20'000'000ull}   // 任务3：20ms周期
+        };
     };
 
     DirectionConfig d0;
@@ -487,7 +490,7 @@ int main(int argc, char* argv[]) {
     d0.direction_name = "can00_to_can10";
     d0.tx_rt = {"tx_can00", common_policy, tx_prio, cpu_map[0]};
     d0.rx_rt = {"rx_can10", common_policy, rx_prio, cpu_map[1]};
-    d0.tasks = tasks;
+    d0.tasks = create_tasks_for_direction(0x100);
 
     DirectionConfig d1;
     d1.link_id = 1;
@@ -496,7 +499,7 @@ int main(int argc, char* argv[]) {
     d1.direction_name = "can10_to_can00";
     d1.tx_rt = {"tx_can10", common_policy, tx_prio, cpu_map[2]};
     d1.rx_rt = {"rx_can00", common_policy, rx_prio, cpu_map[3]};
-    d1.tasks = tasks;
+    d1.tasks = create_tasks_for_direction(0x200);
 
     DirectionConfig d2;
     d2.link_id = 2;
@@ -505,7 +508,7 @@ int main(int argc, char* argv[]) {
     d2.direction_name = "can01_to_can11";
     d2.tx_rt = {"tx_can01", common_policy, tx_prio, cpu_map[4]};
     d2.rx_rt = {"rx_can11", common_policy, rx_prio, cpu_map[5]};
-    d2.tasks = tasks;
+    d1.tasks = create_tasks_for_direction(0x300);
 
     DirectionConfig d3;
     d3.link_id = 3;
@@ -514,7 +517,7 @@ int main(int argc, char* argv[]) {
     d3.direction_name = "can11_to_can01";
     d3.tx_rt = {"tx_can11", common_policy, tx_prio, cpu_map[6]};
     d3.rx_rt = {"rx_can01", common_policy, rx_prio, cpu_map[7]};
-    d3.tasks = tasks;
+    d3.tasks = create_tasks_for_direction(0x400);
 
     EventQueue queue(1 << 20);
 
