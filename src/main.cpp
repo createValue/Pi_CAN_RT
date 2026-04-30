@@ -256,6 +256,16 @@ static void tx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
     close(fd);
 }
 
+static bool is_expected_rx_ifname(uint8_t link_id, const std::string& rx_ifname) {
+    switch (link_id) {
+        case 0: return rx_ifname == "can10"; // can00 -> can10
+        case 1: return rx_ifname == "can00"; // can10 -> can00
+        case 2: return rx_ifname == "can11"; // can01 -> can11
+        case 3: return rx_ifname == "can01"; // can11 -> can01
+        default: return false;
+    }
+}
+
 static void rx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) {
     apply_thread_rt(dir.rx_rt);
     print_thread_status(dir.rx_rt, "RX");
@@ -283,7 +293,7 @@ static void rx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
         msg.msg_controllen = sizeof(ctrlmsg);
 
         int nbytes = static_cast<int>(recvmsg(fd, &msg, 0));
-        uint64_t rx_user_read_ns = now_monotonic_ns();
+        uint64_t rx_kernel_ts_ns = now_monotonic_ns(); // recvmsg 返回后立即采样，统一 CLOCK_MONOTONIC
 
         if (nbytes < 0) {
             if (errno == EINTR) continue;
@@ -297,16 +307,11 @@ static void rx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
         Payload8 p{};
         std::memcpy(&p, frame.data, sizeof(p));
 
-        uint64_t rx_kernel_ts_ns = 0;
-        for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
-             cmsg != nullptr;
-             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPNS) {
-                auto* ts = reinterpret_cast<struct timespec*>(CMSG_DATA(cmsg));
-                rx_kernel_ts_ns = timespec_to_ns(*ts);
-                break;
-            }
+        if (!is_expected_rx_ifname(p.link_id, dir.rx_ifname)) {
+            continue;
         }
+
+        uint64_t rx_user_read_ns = now_monotonic_ns(); // 用户态完成基础解析后的时间
 
         EventRecord ev{};
         ev.type = EventType::RX;

@@ -61,6 +61,7 @@ struct TaskConfig {
     uint8_t task_id = 0;
     uint32_t can_id = 0x100;
     uint64_t period_ns = 1000000;
+    uint64_t phase_offset_ns = 0;  // 相对方向启动基准 start_ns 的初始相位偏移
 };
 
 struct ThreadRtConfig {
@@ -115,6 +116,8 @@ struct EventRecord {
     uint64_t wakeup_ns = 0;
     uint64_t send_call_ns = 0;
 
+    // 注意：这里不是 SO_TIMESTAMPNS 的内核时间戳，
+    // 而是 recvmsg() 返回后立即采样得到的 CLOCK_MONOTONIC 时间点
     uint64_t rx_kernel_ts_ns = 0;
     uint64_t rx_user_read_ns = 0;
 
@@ -268,8 +271,8 @@ inline int open_can_socket(const std::string& ifname,
         return -1;
     }
 
-    int enable = 1;
-    if (setsockopt(fd, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &enable, sizeof(enable)) < 0) {
+    int recv_own = 0;
+    if (setsockopt(fd, SOL_CAN_RAW, CAN_RAW_RECV_OWN_MSGS, &recv_own, sizeof(recv_own)) < 0) {
         std::perror("setsockopt(CAN_RAW_RECV_OWN_MSGS)");
     }
 
@@ -285,12 +288,8 @@ inline int open_can_socket(const std::string& ifname,
         }
     }
 
-    if (enable_timestamp) {
-        int one = 1;
-        if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof(one)) < 0) {
-            std::perror("setsockopt(SO_TIMESTAMPNS)");
-        }
-    }
+    // 保留接口参数，但当前统一使用 CLOCK_MONOTONIC，不启用 SO_TIMESTAMPNS
+    (void)enable_timestamp;
 
     if (set_recv_timeout) {
         struct timeval tv{};
