@@ -236,9 +236,14 @@ inline bool apply_thread_rt(const ThreadRtConfig& cfg) {
         cpu_set_t cpuset;
         CPU_ZERO(&cpuset);
         CPU_SET(cfg.cpu, &cpuset);
-        if (pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset) != 0) {
-            std::cerr << "[WARN] " << cfg.name << " pthread_setaffinity_np failed: "
-                      << std::strerror(errno) << "\n";
+
+        int rc = pthread_setaffinity_np(tid, sizeof(cpu_set_t), &cpuset);
+        if (rc != 0) {
+            std::cerr << "[WARN] " << cfg.name
+                      << " pthread_setaffinity_np failed"
+                      << " cpu=" << cfg.cpu
+                      << " rc=" << rc
+                      << " (" << std::strerror(rc) << ")\n";
         }
     }
 
@@ -246,19 +251,20 @@ inline bool apply_thread_rt(const ThreadRtConfig& cfg) {
     struct sched_param sp{};
     sp.sched_priority = (policy == SCHED_OTHER) ? 0 : cfg.priority;
 
-    if (pthread_setschedparam(tid, policy, &sp) != 0) {
-        int err = errno;
+    int rc = pthread_setschedparam(tid, policy, &sp);
+    if (rc != 0) {
         std::cerr << "[WARN] " << cfg.name
                   << " pthread_setschedparam failed"
                   << " policy=" << sched_kind_name(cfg.policy)
                   << " priority=" << sp.sched_priority
-                  << " errno=" << err
-                  << " (" << std::strerror(err) << ")\n";
+                  << " rc=" << rc
+                  << " (" << std::strerror(rc) << ")\n";
         return false;
     }
 
     return true;
 }
+
 
 inline int open_can_socket(const std::string& ifname,
                            bool enable_timestamp,

@@ -189,10 +189,11 @@ static void tx_thread_fn(DirectionConfig dir, GlobalConfig gcfg, EventQueue* q) 
     for (const auto& t : dir.tasks) {
         TaskRuntime rt;
         rt.cfg = t;
-        rt.next_release_ns = start_ns;
+        rt.next_release_ns = start_ns + t.phase_offset_ns;
         rt.seq = 0;
         runtimes.push_back(rt);
     }
+
 
     while (!g_stop.load()) {
         uint64_t nearest_ns = UINT64_MAX;
@@ -551,10 +552,24 @@ int main(int argc, char* argv[]) {
             rt.name = "stress" + std::to_string(i);
             rt.policy = SchedKind::OTHER;
             rt.priority = 0;
-            rt.cpu = (gcfg.stress_cpu_start >= 0) ? (gcfg.stress_cpu_start + i) : -1;
+
+            if (gcfg.stress_cpu_start >= 0) {
+                // Stage B 树莓派 4 核实验:
+                // stress 线程固定限制在 CPU2 和 CPU3 上轮转
+                // 例如 stress_cpu_start=2 时：
+                // stress0 -> CPU2
+                // stress1 -> CPU3
+                // stress2 -> CPU2
+                // stress3 -> CPU3
+                rt.cpu = gcfg.stress_cpu_start + (i % 2);
+            } else {
+                rt.cpu = -1;
+            }
+
             stress_threads.emplace_back(stress_thread_fn, rt);
         }
     }
+
 
     uint64_t t_end = now_monotonic_ns() + static_cast<uint64_t>(gcfg.duration_sec) * 1000000000ull;
     while (!g_stop.load() && now_monotonic_ns() < t_end) {
