@@ -1,6 +1,8 @@
 # rpi_can_loop_rt
 
-树莓派 4 通道 SocketCAN 双链路双向实时性实验程序。
+任务调度及CPU亲和性对CAN总线实时性性能影响研究程序。
+## 硬件环境：树莓派 4B + 2块CAN扩展卡
+4通道 SocketCAN 双链路双向CAN。
 
 ## 物理连接
 - can00 <-> can10
