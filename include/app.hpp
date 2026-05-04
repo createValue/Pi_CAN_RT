@@ -161,6 +161,10 @@ public:
 
     uint64_t dropped() const { return dropped_.load(); }
 
+    void notify_stop() {
+        cv_.notify_all();
+    }
+
 private:
     std::deque<EventRecord> q_;
     size_t max_size_;

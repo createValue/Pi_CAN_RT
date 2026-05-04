@@ -109,7 +109,7 @@ static void logger_write_info(std::ofstream& ofs, const EventRecord& ev, const s
         << '"' << msg << '"' << '\n';
 }
 
-static void logger_thread_fn(EventQueue* q, const std::string out_dir) {
+static void logger_thread_fn(EventQueue* q, const std::string& out_dir) {
     ensure_dir(out_dir);
 
     std::ofstream tx_ofs(out_dir + "/tx_log.csv");
@@ -120,10 +120,7 @@ static void logger_thread_fn(EventQueue* q, const std::string out_dir) {
     write_csv_header_rx(rx_ofs);
     write_csv_header_info(info_ofs);
 
-    EventRecord ev{};
-    while (!g_stop.load()) {
-        if (!q->pop(ev, g_stop)) continue;
-
+    auto write_one = [&](const EventRecord& ev) {
         if (ev.type == EventType::TX) {
             logger_write_tx(tx_ofs, ev);
         } else if (ev.type == EventType::RX || ev.type == EventType::LOSS) {
@@ -131,22 +128,34 @@ static void logger_thread_fn(EventQueue* q, const std::string out_dir) {
         } else {
             logger_write_info(info_ofs, ev, ev.thread_name);
         }
+    };
+
+    EventRecord ev{};
+
+    while (true) {
+        bool ok = q->pop(ev, g_stop);
+
+        if (!ok) {
+            if (g_stop.load()) {
+                break;
+            }
+            continue;
+        }
+
+        write_one(ev);
     }
 
     while (q->drain_one(ev)) {
-        if (ev.type == EventType::TX) {
-            logger_write_tx(tx_ofs, ev);
-        } else if (ev.type == EventType::RX || ev.type == EventType::LOSS) {
-            logger_write_rx(rx_ofs, ev);
-        } else {
-            logger_write_info(info_ofs, ev, ev.thread_name);
-        }
+        write_one(ev);
     }
 
     tx_ofs.flush();
     rx_ofs.flush();
     info_ofs.flush();
+
+    std::cout << "[EXIT] logger thread exit\n";
 }
+
 
 static void sleep_until_ns(uint64_t target_ns) {
     while (!g_stop.load()) {
@@ -577,6 +586,7 @@ int main(int argc, char* argv[]) {
     }
 
     g_stop.store(true);
+    queue.notify_stop();
 
     tx0.join();
     rx0.join();
